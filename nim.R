@@ -42,7 +42,7 @@ library(odbc)
 library(dplyr)
 
 DSN        <- "ReportDatabase"   # the live server, as in 0_Get_ISG_Historical_Live_Server.R
-OUT_DIR    <- getwd()            # the extract and the csv are written here
+OUT_DIR    <- getwd()            # the extract, the csv and the workbook are written here
 START_YEAR <- 2005               # first year reported (before 2002Q3 credit unions
                                  # under $50M filed only in June and December)
 CU_TYPES   <- c(1, 2)            # federally insured: 1 = FCU, 2 = FISCU
@@ -263,7 +263,54 @@ print(as.data.frame(chk), row.names = FALSE)
 ##   assets right, nii_bn far off     -> the income accounts are not the ones pulled in [2.3]
 
 ## ---------------------------------------------------------------------
-## [2.9] Save, and a quick look
+## [2.9] Annual NIM
+## ---------------------------------------------------------------------
+## A full year is the fourth-quarter nim_ytd: the year's net interest
+## income over the average of assets at that year-end and the one before
+## (the Q4 rows checked in [2.8]). The current year is its latest quarter:
+## income year to date, annualized.
+nim_annual <- nim %>%
+  group_by(year) %>%
+  filter(quarter == max(quarter)) %>%
+  ungroup() %>%
+  mutate(nim   = round(nim_ytd, NIM_DECIMALS),
+         type  = if_else(quarter == 4, "Actual", "Year to date"),
+         basis = if_else(quarter == 4, "Full year", paste0("Through ", period, ", annualized"))) %>%
+  select(year, nim, type, basis)
+
+print(as.data.frame(tail(nim_annual, 8)), row.names = FALSE)
+## LOOK: one row per year; only the last row can be "Year to date"
+
+## ---------------------------------------------------------------------
+## [2.10] Forecast: the average of the previous five years
+## ---------------------------------------------------------------------
+## The averages are taken over the rounded values in the table, so each
+## forecast can be checked by hand from the years named in its basis.
+stopifnot(nrow(nim_annual) >= FC_WINDOW)
+
+last_year <- max(nim_annual$year)
+fc_years  <- last_year + seq_len(FC_YEARS)
+
+nim_by_year <- setNames(nim_annual$nim, nim_annual$year)   # each forecast is added to this as it is made
+fc_basis    <- character(0)
+for (y in fc_years) {
+  yrs <- if (FC_ROLLING) (y - FC_WINDOW):(y - 1) else (last_year - FC_WINDOW + 1):last_year
+  avg <- mean(nim_by_year[as.character(yrs)])
+  nim_by_year[as.character(y)] <- round(avg + 1e-9, NIM_DECIMALS)   # + 1e-9: an exact half rounds up, as in Excel
+  fc_basis <- c(fc_basis, sprintf("Average of %d-%d", min(yrs), max(yrs)))
+}
+
+nim_forecast <- data.frame(year  = fc_years,
+                           nim   = unname(nim_by_year[as.character(fc_years)]),
+                           type  = "Forecast",
+                           basis = fc_basis)
+
+nim_annual_all <- bind_rows(nim_annual, nim_forecast)
+print(as.data.frame(tail(nim_annual_all, FC_WINDOW + FC_YEARS)), row.names = FALSE)
+## LOOK: the last FC_YEARS rows are the forecast; "basis" names the years behind each one
+
+## ---------------------------------------------------------------------
+## [2.11] Quarterly csv, and a quick look
 ## ---------------------------------------------------------------------
 last_period <- nim$period[nrow(nim)]
 last_period                                          ## LOOK: the quarter you expect, e.g. "2026Q3"
@@ -278,3 +325,145 @@ plot(nim_qtr_ts, lwd = 2, xlab = "", ylab = "Percent of average assets",
 lines(nim_ytd_ts, lty = 2)
 legend("top", c("In the quarter, annualized (nim_qtr)", "Year to date, NCUA basis (nim_ytd)"),
        lty = c(1, 2), lwd = c(2, 1), bty = "n")
+
+## ---------------------------------------------------------------------
+## [2.12] Excel workbook: annual history and forecast, quarterly series
+## ---------------------------------------------------------------------
+## openxlsx is blocked on this machine and there is no zip program on it,
+## so the workbook is written with base R alone. A .xlsx file is a zip of
+## a few small XML files: (a) lays out the two tabs, (b) builds the XML,
+## (c) writes the zip, (d) checks the file and opens it in Excel.
+
+## (a) The two tabs
+xl_annual <- as.data.frame(nim_annual_all)
+names(xl_annual) <- c("Year", "NIM (% of average assets)", "Type", "Basis")
+
+xl_quarterly <- as.data.frame(nim_ts)
+names(xl_quarterly) <- c("Period", "Year", "Quarter", "Credit unions",
+                         "NIM year to date (%)", "NIM in the quarter (%)")
+
+xlsx_file <- file.path(OUT_DIR, sprintf("nim_timeseries_%s.xlsx", last_period))
+if (file.exists(xlsx_file) && !suppressWarnings(file.remove(xlsx_file)))
+  stop("Close ", basename(xlsx_file), " in Excel, then run this block again.")
+
+## (b) The XML
+XML_HEAD <- '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+NS_MAIN  <- 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+NS_PKG   <- 'http://schemas.openxmlformats.org/package/2006/'
+REL_DOC  <- 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+TYPE_XL  <- 'application/vnd.openxmlformats-officedocument.spreadsheetml.'
+
+xml_text <- function(x) gsub("<", "&lt;", gsub("&", "&amp;", x, fixed = TRUE), fixed = TRUE)
+
+## One worksheet: a bold header row that stays in view, then the rows of d.
+##   style  cell style of each column: 0 plain, 2 annual NIM, 3 three decimals, 4 thousands separator
+##   width  column widths
+xl_sheet <- function(d, style, width, selected = FALSE) {
+  cols  <- seq_along(d)
+  cells <- lapply(cols, function(j) {
+    ref <- paste0(LETTERS[j], seq_len(nrow(d)) + 1)
+    v   <- d[[j]]
+    if (is.numeric(v)) {                               # a missing or infinite number is left as an empty cell
+      ifelse(is.finite(v), sprintf('<c r="%s" s="%d"><v>%s</v></c>', ref, style[j], sprintf("%.15g", v)), "")
+    } else {
+      sprintf('<c r="%s" t="inlineStr"><is><t>%s</t></is></c>', ref, xml_text(as.character(v)))
+    }
+  })
+  header <- sprintf('<c r="%s1" s="1" t="inlineStr"><is><t>%s</t></is></c>', LETTERS[cols], xml_text(names(d)))
+  rows   <- c(paste(header, collapse = ""), do.call(paste0, cells))
+  paste0(XML_HEAD, '<worksheet ', NS_MAIN, '>',
+         '<sheetViews><sheetView', if (selected) ' tabSelected="1"' else '', ' workbookViewId="0">',
+         '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>',
+         '<selection pane="bottomLeft" activeCell="A2" sqref="A2"/></sheetView></sheetViews>',
+         '<sheetFormatPr defaultRowHeight="15"/>',
+         '<cols>', paste0(sprintf('<col min="%d" max="%d" width="%d" customWidth="1"/>', cols, cols, width),
+                          collapse = ""), '</cols>',
+         '<sheetData>', paste0(sprintf('<row r="%d">%s</row>', seq_along(rows), rows), collapse = ""),
+         '</sheetData>',
+         '<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>',
+         '</worksheet>')
+}
+
+num_fmt <- paste0("0.", strrep("0", NIM_DECIMALS))               # 0.00 when NIM_DECIMALS is 2
+
+parts <- c(
+  "[Content_Types].xml" = paste0(XML_HEAD, '<Types xmlns="', NS_PKG, 'content-types">',
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
+    '<Default Extension="xml" ContentType="application/xml"/>',
+    '<Override PartName="/xl/workbook.xml" ContentType="', TYPE_XL, 'sheet.main+xml"/>',
+    '<Override PartName="/xl/styles.xml" ContentType="', TYPE_XL, 'styles+xml"/>',
+    '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="', TYPE_XL, 'worksheet+xml"/>',
+    '<Override PartName="/xl/worksheets/sheet2.xml" ContentType="', TYPE_XL, 'worksheet+xml"/>',
+    '</Types>'),
+  "_rels/.rels" = paste0(XML_HEAD, '<Relationships xmlns="', NS_PKG, 'relationships">',
+    '<Relationship Id="rId1" Type="', REL_DOC, '/officeDocument" Target="xl/workbook.xml"/>',
+    '</Relationships>'),
+  "xl/workbook.xml" = paste0(XML_HEAD, '<workbook ', NS_MAIN, ' xmlns:r="', REL_DOC, '">',
+    '<bookViews><workbookView/></bookViews>',
+    '<sheets><sheet name="Annual NIM" sheetId="1" r:id="rId1"/>',
+    '<sheet name="Quarterly NIM" sheetId="2" r:id="rId2"/></sheets></workbook>'),
+  "xl/_rels/workbook.xml.rels" = paste0(XML_HEAD, '<Relationships xmlns="', NS_PKG, 'relationships">',
+    '<Relationship Id="rId1" Type="', REL_DOC, '/worksheet" Target="worksheets/sheet1.xml"/>',
+    '<Relationship Id="rId2" Type="', REL_DOC, '/worksheet" Target="worksheets/sheet2.xml"/>',
+    '<Relationship Id="rId3" Type="', REL_DOC, '/styles" Target="styles.xml"/>',
+    '</Relationships>'),
+  "xl/styles.xml" = paste0(XML_HEAD, '<styleSheet ', NS_MAIN, '>',
+    '<numFmts count="2"><numFmt numFmtId="164" formatCode="', num_fmt, '"/>',
+    '<numFmt numFmtId="165" formatCode="0.000"/></numFmts>',
+    '<fonts count="2"><font><sz val="11"/><name val="Calibri"/><family val="2"/></font>',
+    '<font><b/><sz val="11"/><name val="Calibri"/><family val="2"/></font></fonts>',
+    '<fills count="2"><fill><patternFill patternType="none"/></fill>',
+    '<fill><patternFill patternType="gray125"/></fill></fills>',
+    '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>',
+    '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>',
+    '<cellXfs count="5">',
+    '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>',                           # 0 plain
+    '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>',             # 1 bold header
+    '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>',   # 2 annual NIM
+    '<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>',   # 3 three decimals
+    '<xf numFmtId="3" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>',     # 4 thousands
+    '</cellXfs>',
+    '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>',
+    '</styleSheet>'),
+  "xl/worksheets/sheet1.xml" = xl_sheet(xl_annual,    style = c(0, 2, 0, 0),       width = c(8, 28, 14, 30),
+                                        selected = TRUE),
+  "xl/worksheets/sheet2.xml" = xl_sheet(xl_quarterly, style = c(0, 0, 0, 4, 3, 3), width = c(10, 8, 10, 14, 22, 24)))
+
+## (c) The zip. gzfile() does the compression: the file it writes is a 10-byte header, the
+## compressed bytes, then a checksum and the size, which is everything a zip entry stores.
+le <- function(x, n) as.raw((x %/% 256^(0:(n - 1))) %% 256)      # x as n bytes, lowest byte first
+
+zip_write <- function(parts, out) {
+  con <- file(out, "wb"); on.exit(close(con))
+  central <- raw(0)                                               # the directory, written after the files
+  offset  <- 0
+  for (p in names(parts)) {
+    dat <- charToRaw(enc2utf8(parts[[p]]))
+    tmp <- tempfile(fileext = ".gz")
+    gzc <- gzfile(tmp, "wb"); writeBin(dat, gzc); close(gzc)
+    gz  <- readBin(tmp, "raw", file.size(tmp)); unlink(tmp)
+    n   <- length(gz)
+    stopifnot(identical(gz[1:4], as.raw(c(0x1f, 0x8b, 0x08, 0x00))))
+    body  <- gz[11:(n - 8)]
+    name  <- charToRaw(p)
+    entry <- c(le(20, 2), le(0, 2), le(8, 2), le(0, 2), le(33, 2), gz[(n - 7):(n - 4)],
+               le(length(body), 4), le(length(dat), 4), le(length(name), 2), le(0, 2))
+    writeBin(c(as.raw(c(0x50, 0x4b, 0x03, 0x04)), entry, name, body), con)
+    central <- c(central, as.raw(c(0x50, 0x4b, 0x01, 0x02)), le(20, 2), entry,
+                 le(0, 2), le(0, 2), le(0, 2), le(0, 4), le(offset, 4), name)
+    offset <- offset + 30 + length(name) + length(body)
+  }
+  writeBin(c(central, as.raw(c(0x50, 0x4b, 0x05, 0x06)), le(0, 2), le(0, 2), le(length(parts), 2),
+             le(length(parts), 2), le(length(central), 4), le(offset, 4), le(0, 2)), con)
+}
+
+zip_write(parts, xlsx_file)
+
+## (d) Check the file, then open it
+chk_dir <- tempfile()
+unzip(xlsx_file, exdir = chk_dir)
+all(vapply(names(parts), function(p)
+  identical(readBin(file.path(chk_dir, p), "raw", 1e7), charToRaw(enc2utf8(parts[[p]]))), logical(1)))
+## LOOK: TRUE (the workbook unzips back to exactly what was built)
+
+shell.exec(normalizePath(xlsx_file))                 # opens the workbook in Excel
