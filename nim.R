@@ -25,10 +25,10 @@
 ##   an annual series  each full year: NIM for the year, growth December to
 ##                     December. The current year is its latest quarter:
 ##                     NIM year to date, growth over the four quarters to it.
-##   a forecast        the next FC_YEARS years, each one the average of the
-##                     FC_WINDOW years before it
-## and writes an Excel workbook: annual history and forecast on the first
-## tab, the quarterly series on the second.
+##   a forecast        of NIM (the series named in FC_VARS): the next FC_YEARS
+##                     years, each one the average of the FC_WINDOW years before it
+## and writes the annual table, from EXPORT_FROM on and with the forecast, to
+## an Excel workbook that it then opens. The quarterly series goes to a csv.
 ##
 ## Two things differ in the older years:
 ##   Filing    Before 2002Q3 only credit unions over $50 million filed in
@@ -79,9 +79,12 @@ ACCTS <- c("ACCT_010",                                                   # total
 COVER_INC <- 0.995               # interest income
 COVER_INS <- 0.999               # insured shares
 
-## Annual table and forecast, blocks [2.9] and [2.10]
+## Annual table, forecast and export, blocks [2.9], [2.10] and [2.12]
 NIM_DECIMALS    <- 2             # decimals of NIM in the annual table (NCUA publishes two)
 GROWTH_DECIMALS <- 2             # decimals of the two growth rates
+EXPORT_FROM     <- 2000          # first year in the Excel workbook (in R the series still start in START_YEAR)
+FC_VARS         <- "nim"         # the series that get a forecast; for all three use
+                                 # c("nim", "asset_growth", "ins_growth")
 FC_YEARS        <- 10            # years to forecast
 FC_WINDOW       <- 5             # years averaged for each forecast
 FC_ROLLING      <- TRUE          # TRUE:  each forecast year is the average of the FC_WINDOW years
@@ -526,8 +529,8 @@ path <- as.data.frame(annual[, c("year", vars)])     # the history; each forecas
 for (y in fc_years) {
   yrs <- if (FC_ROLLING) (y - FC_WINDOW):(y - 1) else (last_year - FC_WINDOW + 1):last_year
   new <- data.frame(year = y)
-  for (v in vars) {
-    avg      <- mean(path[[v]][match(yrs, path$year)])
+  for (v in vars) {                                  # a series not in FC_VARS gets no forecast: NA
+    avg      <- if (v %in% FC_VARS) mean(path[[v]][match(yrs, path$year)]) else NA_real_
     new[[v]] <- sign(avg) * round(abs(avg) + 1e-9, decimals[[v]])   # an exact half rounds away from zero, as in Excel
   }
   path <- rbind(path, new)
@@ -540,8 +543,9 @@ fcst$basis <- if (FC_ROLLING) sprintf("Average of %d-%d", fcst$year - FC_WINDOW,
 
 annual_all <- bind_rows(annual, fcst)
 print(as.data.frame(tail(annual_all, FC_WINDOW + FC_YEARS)), row.names = FALSE)
-## LOOK: the last FC_YEARS rows are the forecast; "basis" names the years behind each one. An NA
-##       forecast means one of those years has no value.
+## LOOK: the last FC_YEARS rows are the forecast; "basis" names the years behind each one. Only the
+##       series in FC_VARS have a forecast, the others are NA there. An NA for a series in FC_VARS
+##       means one of the years behind it has no value.
 
 ## ---------------------------------------------------------------------
 ## [2.11] Quarterly csv, time-series objects, and a quick look
@@ -566,25 +570,20 @@ for (v in vars) {                                    # history solid, forecast d
 par(op)
 
 ## ---------------------------------------------------------------------
-## [2.12] Excel workbook: annual history and forecast, quarterly series
+## [2.12] Excel workbook: annual_all from EXPORT_FROM on
 ## ---------------------------------------------------------------------
 ## openxlsx is blocked on this machine and there is no zip program on it,
 ## so the workbook is written with base R alone. A .xlsx file is a zip of
-## a few small XML files: (a) lays out the two tabs, (b) builds the XML,
+## a few small XML files: (a) lays out the table, (b) builds the XML,
 ## (c) writes the zip, (d) checks the file and opens it in Excel.
 
-## (a) The two tabs
-xl_annual <- as.data.frame(annual_all)
+## (a) The table
+xl_annual <- as.data.frame(annual_all[annual_all$year >= EXPORT_FROM, ])
 names(xl_annual) <- c("Year", "NIM (% of average assets)", "Asset growth (%)", "Insured share growth (%)",
                       "Type", "Basis")
+range(xl_annual$Year)                                ## LOOK: EXPORT_FROM to the last forecast year
 
-xl_quarterly <- as.data.frame(nim_ts)
-names(xl_quarterly) <- c("Period", "Year", "Quarter", "Credit unions",
-                         "NIM year to date (%)", "NIM in the quarter (%)",
-                         "Assets ($ millions)", "Asset growth, 4 quarters (%)",
-                         "Insured shares ($ millions)", "Insured share growth, 4 quarters (%)", "Note")
-
-xlsx_file <- file.path(OUT_DIR, sprintf("nim_timeseries_%s.xlsx", last_period))
+xlsx_file <- file.path(OUT_DIR, sprintf("annual_all_%s.xlsx", last_period))
 if (file.exists(xlsx_file) && !suppressWarnings(file.remove(xlsx_file)))
   stop("Close ", basename(xlsx_file), " in Excel, then run this block again.")
 
@@ -598,9 +597,9 @@ TYPE_XL  <- 'application/vnd.openxmlformats-officedocument.spreadsheetml.'
 xml_text <- function(x) gsub("<", "&lt;", gsub("&", "&amp;", x, fixed = TRUE), fixed = TRUE)
 
 ## One worksheet: a bold header row that stays in view, then the rows of d.
-##   style  cell style of each column: 0 plain, 2 NIM, 3 three decimals, 4 thousands separator, 5 growth
+##   style  cell style of each column: 0 plain, 2 NIM, 3 growth
 ##   width  column widths
-xl_sheet <- function(d, style, width, selected = FALSE) {
+xl_sheet <- function(d, style, width) {
   cols  <- seq_along(d)
   cells <- lapply(cols, function(j) {
     ref <- paste0(LETTERS[j], seq_len(nrow(d)) + 1)
@@ -615,7 +614,7 @@ xl_sheet <- function(d, style, width, selected = FALSE) {
   header <- sprintf('<c r="%s1" s="1" t="inlineStr"><is><t>%s</t></is></c>', LETTERS[cols], xml_text(names(d)))
   rows   <- c(paste(header, collapse = ""), do.call(paste0, cells))
   paste0(XML_HEAD, '<worksheet ', NS_MAIN, '>',
-         '<sheetViews><sheetView', if (selected) ' tabSelected="1"' else '', ' workbookViewId="0">',
+         '<sheetViews><sheetView tabSelected="1" workbookViewId="0">',
          '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>',
          '<selection pane="bottomLeft" activeCell="A2" sqref="A2"/></sheetView></sheetViews>',
          '<sheetFormatPr defaultRowHeight="15"/>',
@@ -637,44 +636,35 @@ parts <- c(
     '<Override PartName="/xl/workbook.xml" ContentType="', TYPE_XL, 'sheet.main+xml"/>',
     '<Override PartName="/xl/styles.xml" ContentType="', TYPE_XL, 'styles+xml"/>',
     '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="', TYPE_XL, 'worksheet+xml"/>',
-    '<Override PartName="/xl/worksheets/sheet2.xml" ContentType="', TYPE_XL, 'worksheet+xml"/>',
     '</Types>'),
   "_rels/.rels" = paste0(XML_HEAD, '<Relationships xmlns="', NS_PKG, 'relationships">',
     '<Relationship Id="rId1" Type="', REL_DOC, '/officeDocument" Target="xl/workbook.xml"/>',
     '</Relationships>'),
   "xl/workbook.xml" = paste0(XML_HEAD, '<workbook ', NS_MAIN, ' xmlns:r="', REL_DOC, '">',
     '<bookViews><workbookView/></bookViews>',
-    '<sheets><sheet name="Annual" sheetId="1" r:id="rId1"/>',
-    '<sheet name="Quarterly" sheetId="2" r:id="rId2"/></sheets></workbook>'),
+    '<sheets><sheet name="annual_all" sheetId="1" r:id="rId1"/></sheets></workbook>'),
   "xl/_rels/workbook.xml.rels" = paste0(XML_HEAD, '<Relationships xmlns="', NS_PKG, 'relationships">',
     '<Relationship Id="rId1" Type="', REL_DOC, '/worksheet" Target="worksheets/sheet1.xml"/>',
-    '<Relationship Id="rId2" Type="', REL_DOC, '/worksheet" Target="worksheets/sheet2.xml"/>',
-    '<Relationship Id="rId3" Type="', REL_DOC, '/styles" Target="styles.xml"/>',
+    '<Relationship Id="rId2" Type="', REL_DOC, '/styles" Target="styles.xml"/>',
     '</Relationships>'),
   "xl/styles.xml" = paste0(XML_HEAD, '<styleSheet ', NS_MAIN, '>',
-    '<numFmts count="3"><numFmt numFmtId="164" formatCode="', fmt_nim, '"/>',
-    '<numFmt numFmtId="165" formatCode="0.000"/>',
-    '<numFmt numFmtId="166" formatCode="', fmt_growth, '"/></numFmts>',
+    '<numFmts count="2"><numFmt numFmtId="164" formatCode="', fmt_nim, '"/>',
+    '<numFmt numFmtId="165" formatCode="', fmt_growth, '"/></numFmts>',
     '<fonts count="2"><font><sz val="11"/><name val="Calibri"/><family val="2"/></font>',
     '<font><b/><sz val="11"/><name val="Calibri"/><family val="2"/></font></fonts>',
     '<fills count="2"><fill><patternFill patternType="none"/></fill>',
     '<fill><patternFill patternType="gray125"/></fill></fills>',
     '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>',
     '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>',
-    '<cellXfs count="6">',
+    '<cellXfs count="4">',
     '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>',                           # 0 plain
     '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>',             # 1 bold header
     '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>',   # 2 NIM
-    '<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>',   # 3 three decimals
-    '<xf numFmtId="3" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>',     # 4 thousands
-    '<xf numFmtId="166" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>',   # 5 growth
+    '<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>',   # 3 growth
     '</cellXfs>',
     '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>',
     '</styleSheet>'),
-  "xl/worksheets/sheet1.xml" = xl_sheet(xl_annual, style = c(0, 2, 5, 5, 0, 0), width = c(8, 28, 18, 26, 14, 56),
-                                        selected = TRUE),
-  "xl/worksheets/sheet2.xml" = xl_sheet(xl_quarterly, style = c(0, 0, 0, 4, 3, 3, 4, 3, 4, 3, 0),
-                                        width = c(10, 8, 10, 14, 22, 24, 20, 28, 28, 36, 52)))
+  "xl/worksheets/sheet1.xml" = xl_sheet(xl_annual, style = c(0, 2, 3, 3, 0, 0), width = c(8, 28, 18, 26, 14, 56)))
 
 ## (c) The zip. gzfile() does the compression: the file it writes is a 10-byte header, the
 ## compressed bytes, then a checksum and the size, which is everything a zip entry stores.
