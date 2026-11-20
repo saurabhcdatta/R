@@ -22,11 +22,13 @@
 ##            A true quarterly series: the one to use for time-series work.
 ##
 ## From the quarterly series the script builds
-##   an annual series  each full year: NIM for the year, growth December to
-##                     December. The current year is its latest quarter:
-##                     NIM year to date, growth over the four quarters to it.
-##   a forecast        of NIM (the series named in FC_VARS): the next FC_YEARS
-##                     years, each one the average of the FC_WINDOW years before it
+##   an annual series  each full year: NIM for the year, total assets at the
+##                     year-end, growth December to December. The current
+##                     year is its latest quarter: NIM year to date, assets at
+##                     that quarter-end, growth over the four quarters to it.
+##   a forecast        of NIM (the series named in FC_VARS): the average of
+##                     the last FC_WINDOW years, the current year to date
+##                     included, held constant for the next FC_YEARS years
 ## and writes the annual table, from EXPORT_FROM on and with the forecast, to
 ## an Excel workbook that it then opens. The quarterly series goes to a csv.
 ##
@@ -58,6 +60,8 @@ library(odbc)
 library(dplyr)
 library(tidyr)
 
+options(scipen = 999)            # dollar totals print in full, not as 2.4e+12
+
 DSN        <- "ReportDatabase"   # the live server, as in 0_Get_ISG_Historical_Live_Server.R
 OUT_DIR    <- getwd()            # the extract, the csv and the workbook are written here
 START_YEAR <- 1991               # first year reported; the pull starts one year earlier
@@ -85,12 +89,8 @@ GROWTH_DECIMALS <- 2             # decimals of the two growth rates
 EXPORT_FROM     <- 2000          # first year in the Excel workbook (in R the series still start in START_YEAR)
 FC_VARS         <- "nim"         # the series that get a forecast; for all three use
                                  # c("nim", "asset_growth", "ins_growth")
-FC_YEARS        <- 10            # years to forecast
-FC_WINDOW       <- 5             # years averaged for each forecast
-FC_ROLLING      <- TRUE          # TRUE:  each forecast year is the average of the FC_WINDOW years
-                                 #        before it, so earlier forecasts feed the later ones
-                                 # FALSE: every forecast year is the same number, the average of
-                                 #        the last FC_WINDOW years of history
+FC_WINDOW       <- 5             # years averaged: the current year, to date, and the ones before it
+FC_YEARS        <- 10            # years the average is carried forward
 
 con <- dbConnect(odbc(), dsn = DSN, timeout = 10)
 
@@ -493,9 +493,10 @@ print(as.data.frame(chk90), row.names = FALSE)
 ## ---------------------------------------------------------------------
 ## A full year is its fourth quarter: nim_ytd is then the year's net
 ## interest income over the average of assets at that year-end and the one
-## before, and the four-quarter growth is December to December. The current
-## year is its latest full quarter: NIM year to date, annualized, and growth
-## over the four quarters to that quarter.
+## before, assets are the December total, and the four-quarter growth is
+## December to December. The current year is its latest full quarter: NIM
+## year to date, annualized, assets at that quarter-end, and growth over the
+## four quarters to that quarter.
 annual <- nim %>%
   filter(full) %>%
   group_by(year) %>%
@@ -503,6 +504,7 @@ annual <- nim %>%
   ungroup() %>%
   transmute(year,
             nim          = round(nim_ytd,      NIM_DECIMALS),
+            assets,                                    # total assets at the end of that quarter, in dollars
             asset_growth = round(asset_growth, GROWTH_DECIMALS),
             ins_growth   = round(ins_growth,   GROWTH_DECIMALS),
             type         = if_else(quarter == 4, "Actual", "Year to date"),
@@ -515,37 +517,35 @@ print(as.data.frame(annual), row.names = FALSE)
 ##       for which that item cannot be computed: [2.6] shows which test failed.
 
 ## ---------------------------------------------------------------------
-## [2.10] Forecast: the average of the previous five years
+## [2.10] Forecast: the average of the last five years, held constant
 ## ---------------------------------------------------------------------
-## The averages are taken over the rounded values in the table, so each
-## forecast can be checked by hand from the years named in its basis.
+## The five years are the current year, to date, and the four before it.
+## Their average is the forecast for every one of the next FC_YEARS years.
+## It is taken over the rounded values in the table, so it can be checked
+## by hand from the years named in "basis".
 vars     <- c("nim", "asset_growth", "ins_growth")
 decimals <- c(nim = NIM_DECIMALS, asset_growth = GROWTH_DECIMALS, ins_growth = GROWTH_DECIMALS)
 
 last_year <- max(annual$year)
+base_yrs  <- (last_year - FC_WINDOW + 1):last_year   # the years averaged
 fc_years  <- last_year + seq_len(FC_YEARS)
 
-path <- as.data.frame(annual[, c("year", vars)])     # the history; each forecast year is added as it is made
-for (y in fc_years) {
-  yrs <- if (FC_ROLLING) (y - FC_WINDOW):(y - 1) else (last_year - FC_WINDOW + 1):last_year
-  new <- data.frame(year = y)
-  for (v in vars) {                                  # a series not in FC_VARS gets no forecast: NA
-    avg      <- if (v %in% FC_VARS) mean(path[[v]][match(yrs, path$year)]) else NA_real_
-    new[[v]] <- sign(avg) * round(abs(avg) + 1e-9, decimals[[v]])   # an exact half rounds away from zero, as in Excel
-  }
-  path <- rbind(path, new)
-}
+as.data.frame(annual[annual$year %in% base_yrs, c("year", vars, "type")])
+## LOOK: the FC_WINDOW rows that are averaged; the last one is the current year to date
 
-fcst <- path[path$year %in% fc_years, ]
+fcst <- data.frame(year = fc_years)
+for (v in vars) {                                    # a series not in FC_VARS gets no forecast: NA
+  avg       <- if (v %in% FC_VARS) mean(annual[[v]][match(base_yrs, annual$year)]) else NA_real_
+  fcst[[v]] <- sign(avg) * round(abs(avg) + 1e-9, decimals[[v]])   # an exact half rounds away from zero, as in Excel
+}
 fcst$type  <- "Forecast"
-fcst$basis <- if (FC_ROLLING) sprintf("Average of %d-%d", fcst$year - FC_WINDOW, fcst$year - 1) else
-                              sprintf("Average of %d-%d", last_year - FC_WINDOW + 1, last_year)
+fcst$basis <- sprintf("Average of %d-%d", min(base_yrs), max(base_yrs))
 
 annual_all <- bind_rows(annual, fcst)
 print(as.data.frame(tail(annual_all, FC_WINDOW + FC_YEARS)), row.names = FALSE)
-## LOOK: the last FC_YEARS rows are the forecast; "basis" names the years behind each one. Only the
-##       series in FC_VARS have a forecast, the others are NA there. An NA for a series in FC_VARS
-##       means one of the years behind it has no value.
+## LOOK: the last FC_YEARS rows are the forecast, the same number in every year. Only the series
+##       in FC_VARS have one; the others, and total assets, are NA there. An NA for a series in
+##       FC_VARS means one of the years averaged has no value.
 
 ## ---------------------------------------------------------------------
 ## [2.11] Quarterly csv, time-series objects, and a quick look
@@ -579,8 +579,8 @@ par(op)
 
 ## (a) The table
 xl_annual <- as.data.frame(annual_all[annual_all$year >= EXPORT_FROM, ])
-names(xl_annual) <- c("Year", "NIM (% of average assets)", "Asset growth (%)", "Insured share growth (%)",
-                      "Type", "Basis")
+names(xl_annual) <- c("Year", "NIM (% of average assets)", "Total assets, end of period ($)",
+                      "Asset growth (%)", "Insured share growth (%)", "Type", "Basis")
 range(xl_annual$Year)                                ## LOOK: EXPORT_FROM to the last forecast year
 
 xlsx_file <- file.path(OUT_DIR, sprintf("annual_all_%s.xlsx", last_period))
@@ -597,7 +597,7 @@ TYPE_XL  <- 'application/vnd.openxmlformats-officedocument.spreadsheetml.'
 xml_text <- function(x) gsub("<", "&lt;", gsub("&", "&amp;", x, fixed = TRUE), fixed = TRUE)
 
 ## One worksheet: a bold header row that stays in view, then the rows of d.
-##   style  cell style of each column: 0 plain, 2 NIM, 3 growth
+##   style  cell style of each column: 0 plain, 2 NIM, 3 growth, 4 thousands separator
 ##   width  column widths
 xl_sheet <- function(d, style, width) {
   cols  <- seq_along(d)
@@ -656,15 +656,17 @@ parts <- c(
     '<fill><patternFill patternType="gray125"/></fill></fills>',
     '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>',
     '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>',
-    '<cellXfs count="4">',
+    '<cellXfs count="5">',
     '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>',                           # 0 plain
     '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>',             # 1 bold header
     '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>',   # 2 NIM
     '<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>',   # 3 growth
+    '<xf numFmtId="3" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>',     # 4 thousands
     '</cellXfs>',
     '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>',
     '</styleSheet>'),
-  "xl/worksheets/sheet1.xml" = xl_sheet(xl_annual, style = c(0, 2, 3, 3, 0, 0), width = c(8, 28, 18, 26, 14, 56)))
+  "xl/worksheets/sheet1.xml" = xl_sheet(xl_annual, style = c(0, 2, 4, 3, 3, 0, 0),
+                                        width = c(8, 28, 32, 18, 26, 14, 56)))
 
 ## (c) The zip. gzfile() does the compression: the file it writes is a 10-byte header, the
 ## compressed bytes, then a checksum and the size, which is everything a zip entry stores.
