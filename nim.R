@@ -19,12 +19,19 @@
 ##            / average of assets now and assets one quarter earlier.
 ##            A true quarterly series: the one to use for time-series work.
 ##
+## From these the script also builds
+##   an annual series  each full year, and the current year to date
+##   a forecast        the next five years, each one the average of the
+##                     five years before it
+## and writes an Excel workbook: annual history and forecast on the first
+## tab, the quarterly series on the second.
+##
 ## The newest quarter on the live server is not final until NCUA publishes
 ## it (late and amended filings can still move it). Block [2.3] saves the
 ## extract under the pull date so any number can be traced back.
 ##
 ## Run block by block; every object stays in the environment.
-## Packages: DBI, odbc, dplyr.
+## Packages: DBI, odbc, dplyr. The workbook is written with base R.
 ## =====================================================================
 
 ## ---------------------------------------------------------------------
@@ -39,6 +46,15 @@ OUT_DIR    <- getwd()            # the extract and the csv are written here
 START_YEAR <- 2005               # first year reported (before 2002Q3 credit unions
                                  # under $50M filed only in June and December)
 CU_TYPES   <- c(1, 2)            # federally insured: 1 = FCU, 2 = FISCU
+
+## Annual table and forecast, blocks [2.9] and [2.10]
+NIM_DECIMALS <- 2                # decimals in the annual table (NCUA publishes two)
+FC_YEARS     <- 5                # years to forecast
+FC_WINDOW    <- 5                # years averaged for each forecast
+FC_ROLLING   <- TRUE             # TRUE:  each forecast year is the average of the FC_WINDOW years
+                                 #        before it, so earlier forecasts feed the later ones
+                                 # FALSE: every forecast year is the same number, the average of
+                                 #        the last FC_WINDOW years of history
 
 con <- dbConnect(odbc(), dsn = DSN, timeout = 10)
 
